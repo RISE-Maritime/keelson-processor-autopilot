@@ -1,0 +1,5 @@
+nvector==1.0.1
+simple-pid==2.0.1
+skarv==0.1.0
+keelson==0.4.3
+geojson==3.2.0
