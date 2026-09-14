@@ -12,50 +12,39 @@ Good question. Next?
 ## How?
 Utilizing two PID regulators (one for cross track error and one for heading error) for a predicted vessel state in a future time instant (using dead reckoning).
 
+## Inputs and outputs
+
+Built against keelson `0.6.0rc15`. It subscribes to five subjects:
+
+| Argument | Subject | Unit |
+| --- | --- | --- |
+| `--location_fix-key` | `location_fix` | |
+| `--heading-key` | `heading_true_north_deg` or `heading_magnetic_deg` | deg |
+| `--cog-key` | `course_over_ground_deg` | deg |
+| `--sog-key` | `speed_over_ground_knots` | kn |
+| `--rot-key` | `yaw_rate_degps` | deg/s |
+
+keelson renamed the last two from `speed_over_ground_kn` and `rate_of_turn_degpm`; v0.1.0 still read the old names and never produced an order.
+
+It publishes the wanted rudder angle in percent on `--output-key`, and, with `--throttle-pct`, a constant throttle in percent on `--throttle-output-key` alongside every rudder order.
+
+When an output key is a full pubsub key (`<realm>/@v0/<entity>/pubsub/<subject>/<source>`), the source and subject liveliness tokens are declared for it, so a consumer can require the autopilot before relying on it.
+
+## Taking the helm
+
+With `--install-control-mapping` the autopilot wires its outputs onto the `steering` (and `throttle`) axes of the entity in `--output-key` over `vehicle_control/v1`. It checks every 5 s and installs the mapping only when the vessel reports none, so it comes back after a vessel restart but never overrides a mapping someone else holds.
+
 ## Usage
 
 Supplied as a docker image, which accepts the following arguments:
 ```bash
 usage: keelson-processor-autopilot [-h] [--log-level LOG_LEVEL] [--mode {peer,client}] [--connect CONNECT] --location_fix-key
                                    LOCATION_FIX_KEY --heading-key HEADING_KEY --cog-key COG_KEY --sog-key SOG_KEY --rot-key
-                                   ROT_KEY --output-key OUTPUT_KEY --geojson-track GEOJSON_TRACK [--position-kp POSITION_KP]
-                                   [--position-ki POSITION_KI] [--heading-kp HEADING_KP] [--heading-ki HEADING_KI]
-                                   [--dead-reckon-duration DEAD_RECKON_DURATION]
-
-A generic autopilot for keelson
-
-options:
-  -h, --help            show this help message and exit
-  --log-level LOG_LEVEL
-  --mode {peer,client}, -m {peer,client}
-                        The zenoh session mode. (default: None)
-  --connect CONNECT     Endpoints to connect to, in case multicast is not working. ex. tcp/localhost:7447 (default: None)
-  --location_fix-key LOCATION_FIX_KEY
-                        Key expression to subscribe to with subject 'location_fix' (default: None)
-  --heading-key HEADING_KEY
-                        Key expression to subscribe to with subjects either 'heading_true_north_deg' or 'heading_magnetic_deg'
-                        (default: None)
-  --cog-key COG_KEY     Key expression to subscribe to with subject 'course_over_ground_deg' (default: None)
-  --sog-key SOG_KEY     Key expression to subscribe to with subject 'speed_over_ground_kn' (default: None)
-  --rot-key ROT_KEY     Key expression to subscribe to with subject 'rate_of_turn_degpm' (default: None)
-  --output-key OUTPUT_KEY
-                        Key expression on which to output wanted rudder angle in percent, the payload will be a TimestampedFloat'
-                        (default: None)
-  --geojson-track GEOJSON_TRACK
-                        The path at where to load a GeoJson containing a single LineString geometry that is to be used for
-                        tracking. (default: None)
-  --position-kp POSITION_KP
-                        Proportional coefficient for position error PID, relates cross-track error in meter with rudder angle in
-                        percent (default: 1.0)
-  --position-ki POSITION_KI
-                        Integrating coefficient for position error PID, relates cross-track error in meter with rudder angle in
-                        percent (default: 0.01)
-  --heading-kp HEADING_KP
-                        Proportional coefficient for heading error PID, relates error in heading (towards track bearing) with
-                        rudder angle in percent (default: 2.0)
-  --heading-ki HEADING_KI
-                        Integrating coefficient for heading error PID, relates error in heading (towards track bearing) with
-                        rudder angle in percent (default: 0.02)
-  --dead-reckon-duration DEAD_RECKON_DURATION
-                        Duration to be used for predicting the future position and heading using dead reckoning (default: 30)
+                                   ROT_KEY --output-key OUTPUT_KEY [--throttle-pct THROTTLE_PCT]
+                                   [--throttle-output-key THROTTLE_OUTPUT_KEY] [--install-control-mapping]
+                                   [--max-axis-age-s MAX_AXIS_AGE_S] --geojson-track GEOJSON_TRACK
+                                   [--position-kp POSITION_KP] [--position-ki POSITION_KI] [--heading-kp HEADING_KP]
+                                   [--heading-ki HEADING_KI] [--dead-reckon-duration DEAD_RECKON_DURATION]
 ```
+
+See `python main.py --help` for the description of each argument, and `examples/example.sh` for a local run.
