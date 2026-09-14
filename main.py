@@ -71,7 +71,8 @@ def dead_reckon(
     u = sog * math.cos(cog_relative_bow)
     v = sog * -math.sin(cog_relative_bow)
 
-    for _ in range(duration):
+    # Whole one-second steps; the duration may arrive as a float from the CLI
+    for _ in range(int(duration)):
 
         # Deltas in northing and easting
         delta_northing = u * math.cos(heading) - v * math.sin(heading)
@@ -484,7 +485,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--dead-reckon-duration",
-        type=float,
+        type=int,
         required=False,
         default=30,
         help="Duration to be used for predicting the future position and heading using dead reckoning",
