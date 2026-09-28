@@ -139,6 +139,41 @@ def bearing_of_segment(segment: nv.GeoPath) -> float:
     return angular_average([az_a, az_b])
 
 
+def heading_setpoint_deg(segment: nv.GeoPath) -> float:
+    """The heading the autopilot steers toward, in degrees on [0, 360).
+
+    This is keelson#316's `heading_setpoint_deg`: the bearing of the track
+    segment the heading PID uses as its reference. The cross-track PID is
+    summed into the rudder order, not into this reference, so an XTE
+    correction moves the rudder and never the setpoint. The segment is the
+    one relevant to the dead-reckoned position, as in the control loop.
+    """
+    setpoint = math.degrees(bearing_of_segment(segment)) % 360.0
+    # A bearing a hair below zero rounds to 360.0 under the modulo
+    return 0.0 if setpoint >= 360.0 else setpoint
+
+
+def put_float(publisher, value: float) -> None:
+    message = TimestampedFloat()
+    message.timestamp.FromNanoseconds(time.time_ns())
+    message.value = value
+    publisher.put(keelson.enclose(message.SerializeToString()))
+
+
+def publish_heading_setpoint(publisher, setpoint: float) -> bool:
+    """Publish the setpoint, when there is somewhere to publish it.
+
+    keelson#316: published by whoever holds the setpoint, absent when none
+    is. Without --heading-setpoint-key nothing goes out; and since this is
+    only called from a control tick that produced an order, nothing goes out
+    before the first fix or when no track segment applies either.
+    """
+    if publisher is None:
+        return False
+    put_float(publisher, setpoint)
+    return True
+
+
 def from_keelson_to_skarv(sample: zenoh.Sample):
     try:
         # keelson 0.6 parses a str; zenoh hands the callback a KeyExpr
@@ -299,7 +334,8 @@ def calculate_control_values(
     heading: TimestampedFloat,
     rot: TimestampedFloat,
     dead_reckon_duration: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
+    """The two PID outputs, and the heading setpoint the heading PID references."""
 
     predicted_pos, predicted_hdg = dead_reckon(
         # As GeoPoint
@@ -335,7 +371,7 @@ def calculate_control_values(
     logger.debug("  xte_pid: %s", xte_pid_output)
     logger.debug("  hdg_pid: %s", hdg_pid_output)
 
-    return xte_pid_output, hdg_pid_output
+    return xte_pid_output, hdg_pid_output, heading_setpoint_deg(segment)
 
 
 if __name__ == "__main__":
@@ -426,6 +462,17 @@ if __name__ == "__main__":
         help="Key on which to output --throttle-pct, the payload will be a TimestampedFloat",
     )
 
+    parser.add_argument(
+        "--heading-setpoint-key",
+        type=str,
+        required=False,
+        default=None,
+        help="Key on which to output the heading being steered toward (keelson#316 subject "
+        "'heading_setpoint_deg'), in degrees [0, 360), the payload will be a TimestampedFloat. "
+        "It is the bearing of the track segment the heading PID references; cross-track "
+        "correction acts on the rudder, not on this setpoint. Published with every rudder order",
+    )
+
     ### Taking the helm ###
     parser.add_argument(
         "--install-control-mapping",
@@ -496,6 +543,7 @@ if __name__ == "__main__":
 
     steering_key = parse_output_key(args.output_key)
     throttle_key = parse_output_key(args.throttle_output_key)
+    setpoint_key = parse_output_key(args.heading_setpoint_key)
 
     if (args.throttle_pct is None) != (args.throttle_output_key is None):
         parser.error("--throttle-pct and --throttle-output-key go together")
@@ -543,7 +591,7 @@ if __name__ == "__main__":
         # Announce what this process publishes, grouped per entity and source,
         # so a consumer can require it before it relies on it.
         announced = {}
-        for parsed in (steering_key, throttle_key):
+        for parsed in (steering_key, throttle_key, setpoint_key):
             if parsed is None:
                 continue
             group = (parsed["base_path"], parsed["entity_id"], parsed["source_id"])
@@ -594,7 +642,7 @@ if __name__ == "__main__":
 
             rot: TimestampedFloat = res[0].value
 
-            control_values = calculate_control_values(
+            xte_output, hdg_output, setpoint = calculate_control_values(
                 trajectory,
                 location_fix,
                 sog,
@@ -604,8 +652,13 @@ if __name__ == "__main__":
                 args.dead_reckon_duration,
             )
 
+            # The setpoint goes straight out rather than through skarv: a
+            # skarv key named heading_* would be matched by the
+            # "heading_$*" lookup above and read back as the vessel heading
+            publish_heading_setpoint(setpoint_publisher, setpoint)
+
             # Output to skarv
-            skarv.put("control_value", sum(control_values))
+            skarv.put("control_value", xte_output + hdg_output)
 
         # Zenoh publishers
         publisher = session.declare_publisher(args.output_key)
@@ -614,12 +667,11 @@ if __name__ == "__main__":
             if args.throttle_output_key
             else None
         )
-
-        def put_float(pub, value: float):
-            message = TimestampedFloat()
-            message.timestamp.FromNanoseconds(time.time_ns())
-            message.value = value
-            pub.put(keelson.enclose(message.SerializeToString()))
+        setpoint_publisher = (
+            session.declare_publisher(args.heading_setpoint_key)
+            if args.heading_setpoint_key
+            else None
+        )
 
         # Skarv to keelson. The throttle goes out with every rudder order, so
         # both axes stay fresh together and fall silent together.

@@ -53,7 +53,7 @@ def test_left_side_diverging():
     heading = TimestampedFloat(value=0.0)
     rot = TimestampedFloat(value=0.0)
 
-    xte_pid_output, hdg_pid_output = calculate_control_values(
+    xte_pid_output, hdg_pid_output, _ = calculate_control_values(
         trajectory, location_fix, sog, cog, heading, rot, 30
     )
 
@@ -96,7 +96,7 @@ def test_left_side_converging():
     heading = TimestampedFloat(value=15.0)
     rot = TimestampedFloat(value=0.0)
 
-    xte_pid_output, hdg_pid_output = calculate_control_values(
+    xte_pid_output, hdg_pid_output, _ = calculate_control_values(
         trajectory, location_fix, sog, cog, heading, rot, 30
     )
 
@@ -139,7 +139,7 @@ def test_crossing_from_left_to_right():
     heading = TimestampedFloat(value=70.0)
     rot = TimestampedFloat(value=0.0)
 
-    xte_pid_output, hdg_pid_output = calculate_control_values(
+    xte_pid_output, hdg_pid_output, _ = calculate_control_values(
         trajectory, location_fix, sog, cog, heading, rot, 30
     )
 
