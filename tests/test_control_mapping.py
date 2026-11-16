@@ -6,13 +6,13 @@ from main import (
 )
 
 
-STEERING = "rise/@v0/slipway-alpha/pubsub/wheel_position_pct/autopilot"
-THROTTLE = "rise/@v0/slipway-alpha/pubsub/autopilot_throttle_pct/autopilot"
+STEERING = "rise/@v0/sim-usv-alpha/pubsub/wheel_position_pct/autopilot"
+THROTTLE = "rise/@v0/sim-usv-alpha/pubsub/autopilot_throttle_pct/autopilot"
 
 
 def test_parses_a_concrete_pubsub_key():
     parsed = parse_output_key(STEERING)
-    assert parsed["entity_id"] == "slipway-alpha"
+    assert parsed["entity_id"] == "sim-usv-alpha"
     assert parsed["subject"] == "wheel_position_pct"
     assert parsed["source_id"] == "autopilot"
 

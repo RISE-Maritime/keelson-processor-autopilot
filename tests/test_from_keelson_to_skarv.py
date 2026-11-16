@@ -28,7 +28,7 @@ def _enclosed_float(value: float) -> bytes:
 
 
 def test_a_sample_with_a_key_expr_lands_under_its_subject():
-    key = "rise/@v0/slipway-alpha/pubsub/yaw_rate_degps/sim"
+    key = "rise/@v0/sim-usv-alpha/pubsub/yaw_rate_degps/slipway"
     from_keelson_to_skarv(_Sample(key, _enclosed_float(1.5)))
 
     stored = skarv.get("yaw_rate_degps")
@@ -36,7 +36,7 @@ def test_a_sample_with_a_key_expr_lands_under_its_subject():
 
 
 def test_speed_is_stored_under_the_keelson_0_6_name():
-    key = "rise/@v0/slipway-alpha/pubsub/speed_over_ground_knots/sim"
+    key = "rise/@v0/sim-usv-alpha/pubsub/speed_over_ground_knots/slipway"
     from_keelson_to_skarv(_Sample(key, _enclosed_float(6.0)))
 
     stored = skarv.get("speed_over_ground_knots")
