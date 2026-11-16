@@ -7,7 +7,9 @@ import math
 import logging
 import pathlib
 import argparse
-from typing import Tuple, List
+import threading
+from contextlib import ExitStack
+from typing import Tuple, List, Optional
 
 import skarv
 import skarv.middlewares
@@ -19,6 +21,8 @@ import nvector as nv
 from simple_pid import PID
 from keelson.payloads.Primitives_pb2 import TimestampedFloat
 from keelson.payloads.foxglove.LocationFix_pb2 import LocationFix
+from keelson.interfaces.VehicleControl_pb2 import ControlAxisMapping
+from keelson.scaffolding.liveliness import declare_liveliness
 
 from google.protobuf.message import DecodeError
 
@@ -67,7 +71,8 @@ def dead_reckon(
     u = sog * math.cos(cog_relative_bow)
     v = sog * -math.sin(cog_relative_bow)
 
-    for _ in range(duration):
+    # Whole one-second steps; the duration may arrive as a float from the CLI
+    for _ in range(int(duration)):
 
         # Deltas in northing and easting
         delta_northing = u * math.cos(heading) - v * math.sin(heading)
@@ -134,17 +139,57 @@ def bearing_of_segment(segment: nv.GeoPath) -> float:
     return angular_average([az_a, az_b])
 
 
+def heading_setpoint_deg(segment: nv.GeoPath) -> float:
+    """The heading the autopilot steers toward, in degrees on [0, 360).
+
+    This is keelson#316's `heading_setpoint_deg`: the bearing of the track
+    segment the heading PID uses as its reference. The cross-track PID is
+    summed into the rudder order, not into this reference, so an XTE
+    correction moves the rudder and never the setpoint. The segment is the
+    one relevant to the dead-reckoned position, as in the control loop.
+    """
+    setpoint = math.degrees(bearing_of_segment(segment)) % 360.0
+    # A bearing a hair below zero rounds to 360.0 under the modulo
+    return 0.0 if setpoint >= 360.0 else setpoint
+
+
+def put_float(publisher, value: float) -> None:
+    message = TimestampedFloat()
+    message.timestamp.FromNanoseconds(time.time_ns())
+    message.value = value
+    publisher.put(keelson.enclose(message.SerializeToString()))
+
+
+def publish_heading_setpoint(publisher, setpoint: float) -> bool:
+    """Publish the setpoint, when there is somewhere to publish it.
+
+    keelson#316: published by whoever holds the setpoint, absent when none
+    is. Without --heading-setpoint-key nothing goes out; and since this is
+    only called from a control tick that produced an order, nothing goes out
+    before the first fix or when no track segment applies either.
+    """
+    if publisher is None:
+        return False
+    put_float(publisher, setpoint)
+    return True
+
+
 def from_keelson_to_skarv(sample: zenoh.Sample):
     try:
-        subject = keelson.get_subject_from_pubsub_key(sample.key_expr)
+        # keelson 0.6 parses a str; zenoh hands the callback a KeyExpr
+        subject = keelson.get_subject_from_pubsub_key(str(sample.key_expr))
+        # Every keelson payload travels in an Envelope; decoding the envelope
+        # itself as the payload type yields a message of zeroes
+        _, _, payload = keelson.uncover(sample.payload.to_bytes())
         message = keelson.decode_protobuf_payload_from_type_name(
-            sample.payload.to_bytes(), keelson.get_subject_schema(subject)
+            payload, keelson.get_subject_schema(subject)
         )
     except KeyError:
         logger.exception("Subject is not well-known in %s", sample.key_expr)
         return
     except DecodeError:
         logger.exception("Failed to decode payload on key %s", sample.key_expr)
+        return
 
     skarv.put(subject, message)
 
@@ -162,6 +207,120 @@ def from_geojson_linestring_to_trajectory(line: geojson.LineString) -> Trajector
     return trajectory
 
 
+def parse_output_key(key: Optional[str]) -> Optional[dict]:
+    """The realm, entity, subject and source of a concrete pubsub key.
+
+    None for anything that is not one — a wildcard, or a free-form key like
+    `test/test` — which is still a valid place to publish, just not one that
+    can be announced by liveliness or wired to a vessel's helm.
+    """
+    if not key or "*" in key or "$" in key:
+        return None
+    try:
+        parsed = keelson.parse_pubsub_key(key)
+    except Exception:  # noqa: BLE001 — any unparseable key is simply not a pubsub key
+        return None
+    if not parsed or not parsed.get("subject") or not parsed.get("entity_id"):
+        return None
+    return parsed
+
+
+def build_control_mapping(
+    steering: dict, throttle: Optional[dict], max_axis_age_s: float
+) -> ControlAxisMapping:
+    """A vehicle_control/v1 mapping from this autopilot's own output keys."""
+    mapping = ControlAxisMapping()
+    mapping.max_axis_age_s = max_axis_age_s
+    for axis, parsed in (("steering", steering), ("throttle", throttle)):
+        if parsed is None:
+            continue
+        mapping.axes[axis].entity_id = parsed["entity_id"]
+        mapping.axes[axis].subject = parsed["subject"]
+        mapping.axes[axis].source_id = parsed["source_id"]
+    return mapping
+
+
+def mapping_is_ours(installed: ControlAxisMapping, wanted: ControlAxisMapping) -> bool:
+    """Whether every axis we want is already wired to our subject and source."""
+    for axis, want in wanted.axes.items():
+        if axis not in installed.axes:
+            return False
+        have = installed.axes[axis]
+        if (have.subject, have.source_id) != (want.subject, want.source_id):
+            return False
+    return True
+
+
+def keep_control_mapping(
+    session: zenoh.Session,
+    steering: dict,
+    wanted: ControlAxisMapping,
+    stop: threading.Event,
+    period_s: float = 5.0,
+) -> None:
+    """Hold the vessel's helm mapping for as long as nobody else has it.
+
+    Polls get_control_mapping and installs ours only when the vessel reports
+    no mapping at all — after boot, or after a scenario load cleared it. A
+    mapping held by someone else is left alone and logged once: an operator
+    who has taken the helm is not overridden by a background process.
+    """
+
+    def rpc_key(procedure: str) -> str:
+        return keelson.construct_rpc_key(
+            steering["base_path"],
+            steering["entity_id"],
+            "vehicle_control",
+            "v1",
+            procedure,
+            "*",
+        )
+
+    held_by_other = False
+    while not stop.is_set():
+        try:
+            installed = None
+            for reply in session.get(rpc_key("get_control_mapping"), timeout=2.0):
+                if isinstance(reply.result, zenoh.Sample):
+                    installed = ControlAxisMapping()
+                    installed.ParseFromString(reply.result.payload.to_bytes())
+
+            if installed is None:
+                logger.info(
+                    "No vehicle_control/v1 responder for %s yet", steering["entity_id"]
+                )
+            elif mapping_is_ours(installed, wanted):
+                held_by_other = False
+            elif len(installed.axes) == 0:
+                replies = list(
+                    session.get(
+                        rpc_key("set_control_mapping"),
+                        payload=wanted.SerializeToString(),
+                        timeout=2.0,
+                    )
+                )
+                if any(isinstance(r.result, zenoh.Sample) for r in replies):
+                    logger.info(
+                        "Installed control mapping on %s", steering["entity_id"]
+                    )
+                else:
+                    logger.warning(
+                        "set_control_mapping refused on %s: %s",
+                        steering["entity_id"],
+                        [r.result.payload.to_bytes() for r in replies],
+                    )
+            elif not held_by_other:
+                held_by_other = True
+                logger.warning(
+                    "%s is mapped to someone else; not taking the helm",
+                    steering["entity_id"],
+                )
+        except Exception:  # noqa: BLE001 — the keeper must outlive a bad reply
+            logger.exception("Checking the control mapping failed")
+
+        stop.wait(period_s)
+
+
 # PID controller object
 xte_pid = PID(setpoint=0.0, output_limits=[-50, 50], sample_time=None)
 hdg_pid = PID(setpoint=0.0, output_limits=[-50, 50], sample_time=None)
@@ -175,7 +334,8 @@ def calculate_control_values(
     heading: TimestampedFloat,
     rot: TimestampedFloat,
     dead_reckon_duration: float,
-) -> Tuple[float, float]:
+) -> Tuple[float, float, float]:
+    """The two PID outputs, and the heading setpoint the heading PID references."""
 
     predicted_pos, predicted_hdg = dead_reckon(
         # As GeoPoint
@@ -185,8 +345,8 @@ def calculate_control_values(
         math.radians(cog.value),
         # To radians
         math.radians(heading.value),
-        # To radians/s
-        math.radians(rot.value) / 60,
+        # yaw_rate_degps is already per second; to radians/s
+        math.radians(rot.value),
         dead_reckon_duration,
     )
 
@@ -211,7 +371,7 @@ def calculate_control_values(
     logger.debug("  xte_pid: %s", xte_pid_output)
     logger.debug("  hdg_pid: %s", hdg_pid_output)
 
-    return xte_pid_output, hdg_pid_output
+    return xte_pid_output, hdg_pid_output, heading_setpoint_deg(segment)
 
 
 if __name__ == "__main__":
@@ -265,14 +425,14 @@ if __name__ == "__main__":
         "--sog-key",
         type=str,
         required=True,
-        help="Key expression to subscribe to with subject 'speed_over_ground_kn'",
+        help="Key expression to subscribe to with subject 'speed_over_ground_knots'",
     )
 
     parser.add_argument(
         "--rot-key",
         type=str,
         required=True,
-        help="Key expression to subscribe to with subject 'rate_of_turn_degpm'",
+        help="Key expression to subscribe to with subject 'yaw_rate_degps'",
     )
 
     # Output key
@@ -280,7 +440,53 @@ if __name__ == "__main__":
         "--output-key",
         type=str,
         required=True,
-        help="Key expression on which to output wanted rudder angle in percent, the payload will be a TimestampedFloat'",
+        help="Key on which to output wanted rudder angle in percent, the payload will be a TimestampedFloat. "
+        "A full pubsub key (<realm>/@v0/<entity>/pubsub/<subject>/<source>) also declares liveliness for it",
+    )
+
+    ### Throttle ###
+    parser.add_argument(
+        "--throttle-pct",
+        type=float,
+        required=False,
+        default=None,
+        help="Constant throttle in percent to publish alongside every rudder order. The autopilot steers only; "
+        "a vessel whose dead-man watches both axes needs a throttle order too",
+    )
+
+    parser.add_argument(
+        "--throttle-output-key",
+        type=str,
+        required=False,
+        default=None,
+        help="Key on which to output --throttle-pct, the payload will be a TimestampedFloat",
+    )
+
+    parser.add_argument(
+        "--heading-setpoint-key",
+        type=str,
+        required=False,
+        default=None,
+        help="Key on which to output the heading being steered toward (keelson#316 subject "
+        "'heading_setpoint_deg'), in degrees [0, 360), the payload will be a TimestampedFloat. "
+        "It is the bearing of the track segment the heading PID references; cross-track "
+        "correction acts on the rudder, not on this setpoint. Published with every rudder order",
+    )
+
+    ### Taking the helm ###
+    parser.add_argument(
+        "--install-control-mapping",
+        action="store_true",
+        help="Map the output keys onto the steering (and throttle) axes of the entity named in --output-key "
+        "over vehicle_control/v1, and re-install the mapping whenever the vessel reports it gone",
+    )
+
+    parser.add_argument(
+        "--max-axis-age-s",
+        type=float,
+        required=False,
+        default=1.0,
+        help="Staleness limit requested in the control mapping",
     )
 
     ### Track to follow ###
@@ -326,7 +532,7 @@ if __name__ == "__main__":
 
     parser.add_argument(
         "--dead-reckon-duration",
-        type=float,
+        type=int,
         required=False,
         default=30,
         help="Duration to be used for predicting the future position and heading using dead reckoning",
@@ -334,6 +540,25 @@ if __name__ == "__main__":
 
     # Parse arguments and start doing our thing
     args = parser.parse_args()
+
+    steering_key = parse_output_key(args.output_key)
+    throttle_key = parse_output_key(args.throttle_output_key)
+    setpoint_key = parse_output_key(args.heading_setpoint_key)
+
+    if (args.throttle_pct is None) != (args.throttle_output_key is None):
+        parser.error("--throttle-pct and --throttle-output-key go together")
+    if args.install_control_mapping and steering_key is None:
+        parser.error(
+            "--install-control-mapping needs --output-key to be a full pubsub key"
+        )
+    if (
+        args.install_control_mapping
+        and args.throttle_output_key
+        and throttle_key is None
+    ):
+        parser.error(
+            "--install-control-mapping needs --throttle-output-key to be a full pubsub key"
+        )
 
     # Setup logger
     logging.basicConfig(
@@ -361,7 +586,25 @@ if __name__ == "__main__":
 
     # Construct session
     logger.info("Opening Zenoh session...")
-    with zenoh.open(conf) as session:
+    with zenoh.open(conf) as session, ExitStack() as stack:
+
+        # Announce what this process publishes, grouped per entity and source,
+        # so a consumer can require it before it relies on it.
+        announced = {}
+        for parsed in (steering_key, throttle_key, setpoint_key):
+            if parsed is None:
+                continue
+            group = (parsed["base_path"], parsed["entity_id"], parsed["source_id"])
+            announced.setdefault(group, []).append(parsed["subject"])
+        for (base_path, entity_id, source_id), subjects in announced.items():
+            stack.enter_context(
+                declare_liveliness(
+                    session, base_path, entity_id, source_id, pubsub_subjects=subjects
+                )
+            )
+            logger.info(
+                "Declared liveliness for %s/%s: %s", entity_id, source_id, subjects
+            )
 
         # Throttle the PID update frequency to 5Hz
         skarv.register_middleware(
@@ -387,19 +630,19 @@ if __name__ == "__main__":
 
             cog: TimestampedFloat = res[0].value
 
-            if not (res := skarv.get("speed_over_ground_kn")):
-                logger.info("Found nothing in storage for 'speed_over_ground_kn'")
+            if not (res := skarv.get("speed_over_ground_knots")):
+                logger.info("Found nothing in storage for 'speed_over_ground_knots'")
                 return
 
             sog: TimestampedFloat = res[0].value
 
-            if not (res := skarv.get("rate_of_turn_degpm")):
-                logger.info("Found nothing in storage for 'rate_of_turn_degpm'")
+            if not (res := skarv.get("yaw_rate_degps")):
+                logger.info("Found nothing in storage for 'yaw_rate_degps'")
                 return
 
             rot: TimestampedFloat = res[0].value
 
-            control_values = calculate_control_values(
+            xte_output, hdg_output, setpoint = calculate_control_values(
                 trajectory,
                 location_fix,
                 sog,
@@ -409,23 +652,45 @@ if __name__ == "__main__":
                 args.dead_reckon_duration,
             )
 
+            # The setpoint goes straight out rather than through skarv: a
+            # skarv key named heading_* would be matched by the
+            # "heading_$*" lookup above and read back as the vessel heading
+            publish_heading_setpoint(setpoint_publisher, setpoint)
+
             # Output to skarv
-            skarv.put("control_value", sum(control_values))
+            skarv.put("control_value", xte_output + hdg_output)
 
-        # Zenoh publisher
+        # Zenoh publishers
         publisher = session.declare_publisher(args.output_key)
+        throttle_publisher = (
+            session.declare_publisher(args.throttle_output_key)
+            if args.throttle_output_key
+            else None
+        )
+        setpoint_publisher = (
+            session.declare_publisher(args.heading_setpoint_key)
+            if args.heading_setpoint_key
+            else None
+        )
 
-        # Skarv to keelson
+        # Skarv to keelson. The throttle goes out with every rudder order, so
+        # both axes stay fresh together and fall silent together.
         @skarv.subscribe("control_value")
         def _(sample: skarv.Sample):
+            put_float(publisher, sample.value)
+            if throttle_publisher is not None:
+                put_float(throttle_publisher, args.throttle_pct)
 
-            message = TimestampedFloat()
-            message.timestamp.FromNanoseconds(time.time_ns())
-            message.value = sample.value
-
-            envelope = keelson.enclose(message.SerializeToString())
-
-            publisher.put(envelope)
+        stop = threading.Event()
+        if args.install_control_mapping:
+            wanted = build_control_mapping(
+                steering_key, throttle_key, args.max_axis_age_s
+            )
+            threading.Thread(
+                target=keep_control_mapping,
+                args=(session, steering_key, wanted, stop),
+                daemon=True,
+            ).start()
 
         # Subscribe to data from zenoh network
         session.declare_subscriber(args.location_fix_key, from_keelson_to_skarv)
@@ -440,4 +705,6 @@ if __name__ == "__main__":
                 time.sleep(1)
         except KeyboardInterrupt:
             logger.info("Closing down on user request!")
+        finally:
+            stop.set()
             sys.exit(0)
